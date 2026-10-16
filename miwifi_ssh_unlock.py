@@ -47,7 +47,7 @@ for _stream in (sys.stdout, sys.stderr):
         pass
 
 DEFAULT_KEY = 'a2ffa5c9be07488bbb04a3a47d3c5f6a'
-DEFAULT_DEVICE_ID = '00:e0:4c:dc:43:1c'
+DEFAULT_DEVICE_ID = '00:e0:00:00:00:00'
 SAFE_PWD = re.compile(r'[A-Za-z0-9._-]{1,40}')
 
 
