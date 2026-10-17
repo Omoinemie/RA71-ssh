@@ -11,16 +11,22 @@ Redmi AX1800/CR660X 路由器(MiWiFi 官方固件)一键开启 SSH root
     也可免交互: python miwifi_ssh_unlock.py <IP> <管理密码>
 
 说明:
-  1. 网页登录后台获取 stok (登录算法: SHA1(nonce + SHA1(密码 + key)), key/nonce
-     规则动态从登录页解析, 不同固件版本可自适应)。
+  1. 网页登录后台获取 stok (登录算法: SHA1(nonce + SHA1(密码 + key));
+     key 与 deviceId 均从登录页动态解析 — 脚本不内置任何预设 token/key/MAC,
+     解析失败会直接报错退出。
   2. 通过命令注入接口 /cgi-bin/luci/;stok=<stok>/api/xqdatacenter/request
      (payload api=629) 分块执行开启命令, 每块带标记回显校验。
   3. 开启 dropbear SSH, root 密码默认设为管理密码。
   4. 探测 22 端口 banner 做真实验证。
   5. 自动刷新本机 known_hosts 里该 IP 的主机指纹(每次重开 SSH 都会生成新密钥,
      不刷新的话下次连接会报 HOST IDENTIFICATION HAS CHANGED)。
+  6. 所有 HTTP 请求自动重试(默认 3 次, 超时 30s): 应对路由器偶发断连/超时
+     (例如 dropbear 冷启动时现场生成 RSA 主机密钥较慢)。
 
 仅需 Python 3.6+ 标准库, 无需安装任何依赖。请仅在自己拥有的路由器上使用。
+
+注意: 本脚本获得的是【临时 root】— 该固件重启后修改会丢失, 重跑脚本即可恢复;
+      如需固化(重启后保留), 请自行查找解决方案, 本项目不提供。
 """
 
 import getpass
@@ -46,8 +52,8 @@ for _stream in (sys.stdout, sys.stderr):
     except Exception:
         pass
 
-DEFAULT_KEY = 'a2ffa5c9be07488bbb04a3a47d3c5f6a'
-DEFAULT_DEVICE_ID = '00:e0:00:00:00:00'
+# 注意: 此处不预设任何 key / token / MAC — 全部在 load_login_page() 时
+# 从目标路由器登录页动态解析, 解析不到就报错退出。
 SAFE_PWD = re.compile(r'[A-Za-z0-9._-]{1,40}')
 
 
@@ -83,10 +89,12 @@ class MiWifi(object):
         self.opener = urllib.request.build_opener(
             urllib.request.HTTPCookieProcessor(jar))
         self.stok = None
-        self.key = DEFAULT_KEY
-        self.device_id = DEFAULT_DEVICE_ID
+        self.key = None
+        self.device_id = None
 
-    def _req(self, path, data=None, timeout=12):
+    def _req(self, path, data=None, timeout=30, retries=3, delay=1.5):
+        """带自动重试的 HTTP 请求: 应对路由器 httpd 偶发断连/超时
+        (典型场景: dropbear 冷启动现场生成 RSA 主机密钥较慢, 首次请求易超时)"""
         headers = {
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)',
             'Referer': self.base + '/cgi-bin/luci/web',
@@ -97,16 +105,23 @@ class MiWifi(object):
         if data is not None:
             body = urllib.parse.urlencode(data).encode('utf-8')
             headers['Content-Type'] = 'application/x-www-form-urlencoded'
-        req = urllib.request.Request(self.base + path, data=body, headers=headers)
-        try:
-            with self.opener.open(req, timeout=timeout) as r:
-                return r.read().decode('utf-8', 'replace')
-        except urllib.error.HTTPError as e:
+        last_err = None
+        for attempt in range(retries):
+            req = urllib.request.Request(self.base + path, data=body, headers=headers)
             try:
-                snippet = e.read().decode('utf-8', 'replace')[:160]
+                with self.opener.open(req, timeout=timeout) as r:
+                    return r.read().decode('utf-8', 'replace')
+            except Exception as e:
+                last_err = e  # 超时 / 远端断开 / 连接重置 / HTTPError 等
+            if attempt < retries - 1:
+                time.sleep(delay)
+        if isinstance(last_err, urllib.error.HTTPError):
+            try:
+                snippet = last_err.read().decode('utf-8', 'replace')[:160]
             except Exception:
                 snippet = ''
-            raise Fatal('HTTP %s: %s' % (e.code, snippet))
+            raise Fatal('HTTP %s: %s' % (last_err.code, snippet))
+        raise Fatal('网络错误(已自动重试%d次): %s' % (retries, last_err))
 
     # ---------- 1. 登录 ----------
     def load_login_page(self):
@@ -114,13 +129,17 @@ class MiWifi(object):
         if 'rtloginform' not in html and 'router_password' not in html:
             raise Fatal('打不开登录页, 请确认 IP 正确且路由器可达')
         m = re.search(r"Encrypt\s*=\s*\{[\s\S]{0,300}?key\s*:\s*'([0-9a-fA-F]+)'", html)
-        if m:
-            self.key = m.group(1)
+        if not m:
+            raise Fatal('未能从登录页解析到加密参数 key, 该固件登录方式可能不同, 请勿强行使用')
+        self.key = m.group(1)
         m = re.search(r"nonceCreat\s*:\s*function[\s\S]{0,200}?deviceId\s*=\s*'([^']+)'", html)
-        if m:
-            self.device_id = m.group(1)
+        if not m:
+            raise Fatal('未能从登录页解析到 nonce 用的 deviceId, 该固件登录方式可能不同, 请勿强行使用')
+        self.device_id = m.group(1)
 
     def login(self, password):
+        if not self.key or not self.device_id:
+            raise Fatal('登录参数未就绪(请先读取登录页)')
         nonce = '0_%s_%d_%d' % (self.device_id, int(time.time()), random.randint(0, 9999))
         inner = hashlib.sha1((password + self.key).encode('utf-8')).hexdigest()
         hashed = hashlib.sha1((nonce + inner).encode('utf-8')).hexdigest()
@@ -253,7 +272,7 @@ def build_chunks(ssh_pwd):
          "; echo C4; sed -i 's/channel=.*/channel=debug/g' /etc/init.d/dropbear; #", 'C4'),
         ('设置 root 密码',
          '; echo C5; ({ echo %s; echo %s; } | passwd root); #' % (ssh_pwd, ssh_pwd), 'C5'),
-        ('注册开机自启并立即启动 dropbear',
+        ('启动 dropbear',
          '; echo C6; /etc/init.d/dropbear enable; /etc/init.d/dropbear start; '
          'echo /etc/init.d/dropbear >> /etc/sysupgrade.conf; #', 'C6'),
     ]
@@ -313,7 +332,8 @@ def main():
     print('  用户名: root')
     print('  密码: %s' % ('与管理密码相同' if ssh_pwd == admin_pwd else '你设置的专用密码'))
     print('')
-    print('提示: 该固件重启后可能丢失以上修改, 再运行一次本脚本即可重新开启。')
+    print('提示: 本脚本开启的是【临时 root】, 该固件重启后会失效, 重跑一次即可恢复。')
+    print('      如需固化(重启后保留), 请自行查找解决方案, 本项目不提供。')
 
 
 if __name__ == '__main__':

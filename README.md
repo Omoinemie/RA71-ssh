@@ -2,24 +2,6 @@
 
 **Redmi AX1800/CR660X 路由器(MiWiFi 官方固件)一键开启 SSH 脚本。**
 
-**测试固件版本：1.0.93，cr660x的运营商固件请先用恢复工具刷为小米官方固件**
-
-纯标准库实现，**零依赖**，输入路由器 IP 和管理密码即可完成，自带连接验证和本机主机指纹自动刷新。
-
-> ⚠️ **免责声明**：本工具仅供学习研究以及管理**自己拥有的**路由器使用。请遵守当地法律法规与厂商服务条款，勿用于他人设备。
-
----
-
-## 功能特性
-
-- ✅ 复刻网页端登录算法，自动获取会话 `stok`（加密参数从登录页动态解析，不写死，适配不同固件版本）
-- ✅ 通过命令注入通道分块执行开启命令，**每块带回显标记校验**，任一步失败都会明确报错
-- ✅ 开启 dropbear SSH 并设置 root 密码（默认与管理密码相同）
-- ✅ 写入 `nvram` 持久化标志 + 注册开机自启
-- ✅ 真实探测 22 端口 banner 验证开启结果
-- ✅ **自动刷新本机 `known_hosts` 主机指纹**，重跑脚本后直接连接，不再报 `HOST IDENTIFICATION HAS CHANGED`
-- ✅ 纯标准库，Python 3.6+ 开箱即用，无需 `pip install`
-
 ## 测试环境
 
 | 项目 | 值 |
@@ -31,6 +13,27 @@
 | 平台 | Windows / Linux / macOS |
 
 同代采用 MiWiFi 网页后台（`/cgi-bin/luci/;stok=...` 结构）的小米/Redmi 路由器理论上均可，脚本会在运行时检测注入通道是否存在，不支持时会明确提示。
+
+纯标准库实现，**零依赖**，输入路由器 IP 和管理密码即可完成，自带连接验证和本机主机指纹自动刷新。
+
+> ⚠️ **免责声明**：本工具仅供学习研究以及管理**自己拥有的**路由器使用。请遵守当地法律法规与厂商服务条款，勿用于他人设备。
+
+> 🔑 **临时 root**：本脚本开启的是**临时 root**，该固件重启后 SSH 会失效（重跑脚本即可恢复）。**固化（重启后保留）方案请自行查找解决方案**，本项目不提供、不承诺。
+
+---
+
+## 功能特性
+
+- ✅ 复刻网页端登录算法，自动获取会话 `stok`（`key` / `deviceId` 均从登录页动态解析，解析失败直接报错退出）
+- ✅ 通过命令注入通道分块执行开启命令，每块带回显标记校验，任一步失败都会明确报错
+- ✅ 开启 dropbear SSH 并设置 root 密码（默认与管理密码相同）
+- ✅ 写入 `nvram` 标志（`ssh_en` 等）
+- ✅ 真实探测 22 端口 banner 验证开启结果
+- ✅ 自动刷新本机 `known_hosts` 主机指纹，重跑脚本后直接连接，不再报 `HOST IDENTIFICATION HAS CHANGED`
+- ✅ 纯标准库，Python 3.6+ 开箱即用，无需 `pip install`
+- ✅ 网络请求自动重试 ×3 + 30s 超时，应对路由器 httpd 偶发断连、dropbear 冷启动生成密钥慢导致的失败
+
+
 
 ## 使用方法
 
@@ -51,10 +54,12 @@ python miwifi_ssh_unlock.py
 [OK] 移除 dropbear 启动脚本里的 SSH 限制
 [OK] 设置 dropbear channel=debug
 [OK] 设置 root 密码
-[OK] 注册开机自启并立即启动 dropbear
+[OK] 启动 dropbear
 [OK] nvram ssh_en=1 已生效
 [OK] SSH 已开启: SSH-2.0-dropbear
 [OK] 本机 known_hosts 主机指纹已更新为本次新密钥, 可直接连接
+提示: 本脚本开启的是【临时 root】, 该固件重启后会失效, 重跑一次即可恢复。
+      如需固化(重启后保留), 请自行查找解决方案, 本项目不提供。
 ```
 
 ### 免交互
@@ -74,36 +79,11 @@ ssh -o HostKeyAlgorithms=+ssh-rsa root@192.168.31.1
 
 如果管理密码包含特殊字符（脚本白名单为 `字母 数字 . _ -`），脚本会提示单独设置一个 SSH root 密码。
 
-## 工作原理
-
-1. **登录取 stok**
-   - 抓取 `/cgi-bin/luci/web` 登录页，动态解析 `Encrypt.key` 与 `nonceCreat.deviceId`
-   - `nonce = 0_<deviceId>_<unix时间>_<随机数>`
-   - `password = SHA1(nonce + SHA1(明文密码 + key))`
-   - `POST /cgi-bin/luci/api/xqsystem/login`（`username=admin&logtype=2`），返回的 `url`/`token` 中携带 `stok`
-
-2. **命令注入**
-   - 接口：`GET /cgi-bin/luci/;stok=<stok>/api/xqdatacenter/request?payload={"api":629,"appid":"<命令>"}`
-   - `appid` 拼进 shell 执行（即 CVE-2023-26315 同类通道）
-   - 两个实测约束（脚本已内置处理）：
-     - **payload 长度上限约 200+ 字符**，超长会被截断（截断点落在引号里会整行语法错误），所以命令必须**分块执行**
-     - 输出只回显**第一行**，因此每块命令以 `; echo 标记; ...` 开头，用标记做成功校验
-     - 单引号原样保留，双引号会被转义破坏 → 全程只用单引号
-
-3. **开启 SSH**
-   - `nvram set ssh_en=1` 等标志 + `nvram commit`
-   - 备份并修补 `/etc/init.d/dropbear`（移除 release 守卫、`channel=debug`）
-   - `({ echo 密码; echo 密码; } | passwd root)` 设置 root 密码
-   - `dropbear enable + start`，并追加到 `/etc/sysupgrade.conf` 保留修改
-
-4. **验证与指纹**
-   - 探测 22 端口读取 `SSH-2.0-dropbear` banner
-   - `ssh-keygen -R <ip>` 清旧指纹 → `ssh-keyscan -t rsa` 抓新密钥 → 写入 `~/.ssh/known_hosts`
 
 ## 常见问题（FAQ）
 
 **Q: 重启后 SSH 又没了？**
-该固件开机可能重建 overlay / nvram（`nvram_corrupt=1` 时尤其明显），导致上次修改丢失。**重跑一次脚本即可**，几秒钟完成。
+本脚本提供的是**临时 root**：该固件开机可能重建 overlay / nvram（`nvram_corrupt=1` 时尤其明显），重启后修改丢失属于预期行为。**重跑一次脚本即可恢复**（几秒钟）。如需固化（重启后保留），请自行检索社区的固化方案，本项目不提供。
 
 **Q: 连接报 `REMOTE HOST IDENTIFICATION HAS CHANGED`？**
 每次重新开启 SSH，dropbear 都会生成新主机密钥（旧密钥存在 overlay 里，随重启丢失）。脚本每次运行都会自动刷新 `known_hosts`；如果手动处理：
@@ -129,19 +109,8 @@ stok 会过期，直接重新运行脚本即可（脚本会重新登录）。
 **Q: 22 端口一直等不到 banner？**
 看前面是否有 `[X ]` 步骤报错；也确认路由器防火墙未拦截本机访问。
 
-## 安全建议
-
-- 仅在**自己拥有**的路由器上使用
-- SSH 仅用于内网管理，**不要在防火墙上放行 22 端口到外网**
-- 建议登录后执行 `passwd root` 设置独立于管理密码的强密码
-- root 权限极高，操作前确认命令
-
-## 文件
-
-```
-miwifi_ssh_unlock.py   # 主脚本（约 330 行，纯标准库）
-README.md              # 本说明
-```
+**Q: 脚本偶尔报 `网络错误`（timed out / Remote end closed）？**
+两个常见原因：路由器 web 服务偶发繁忙/断连；或 dropbear **首次启动时现场生成 RSA 主机密钥**（MIPS 小 CPU 上可能要十几秒）导致请求超时——此时命令往往已经在路由器上执行成功，**重跑一次通常就正常**。脚本已内置 3 次自动重试 + 30s 超时，可覆盖绝大多数情况。
 
 ## 参考
 
